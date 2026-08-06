@@ -22,7 +22,6 @@ import os
 import json
 import base64
 import asyncio
-import audioop
 from datetime import datetime
 
 import websockets
