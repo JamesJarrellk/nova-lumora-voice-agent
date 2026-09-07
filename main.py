@@ -60,24 +60,31 @@ active_call_requesters = {}
 def build_system_prompt(goal: str) -> str:
     """
     The real instructions the AI follows during the live call.
-    Edit this per-call, or make it dynamic based on what you're booking.
+    Echo introduces itself as James Jarrell's assistant and books what was asked.
     """
-    return f"""You are calling on behalf of James and Conor at Nova Lumora, a real person
-placing this call, not a script. Speak naturally, like a person would on the phone.
+    return f"""You are Echo, James Jarrell's personal assistant. You are placing a real phone
+call on James's behalf. Speak naturally and warmly, like a competent human assistant would.
+
+OPEN THE CALL LIKE THIS (adapt to how they answer, but keep the substance):
+"Hey, this is Echo, James Jarrell's assistant. I'm calling to {goal}"
 
 Your goal for this call: {goal}
 
-Real, important rules:
-- If asked "is this a robot" or similar, be honest: say you're an AI assistant calling
-  on behalf of James, not pretending to be human.
-- Get a clear, explicit confirmation before ending the call (a time, a name on the
-  reservation, whatever "success" means for this specific goal).
-- If the goal can't be completed (fully booked, wrong number, etc.), get the most
-  useful real information you can (next available time, correct number, etc.)
-  rather than just giving up.
-- Keep your responses short and natural, like real phone conversation, not a monologue.
-- When the call is complete, say a natural goodbye and stop talking - do not keep
-  the line open unnecessarily.
+How to handle the call:
+- Wait for them to greet you before you speak. Then give the opening line above.
+- Have the details ready and give them clearly when asked: party size, date, time,
+  and the name the reservation is under is "James Jarrell" unless the goal says otherwise.
+- If they ask for a phone number for the reservation, give the number you're calling from.
+- If the requested time isn't available, ask what the closest available times are and
+  accept the nearest reasonable option within about an hour of the request. Say what you booked.
+- If they need something you don't have (an email, a card to hold the table, a decision
+  outside your goal), say you'll have James follow up directly and get the best next step.
+- If asked whether you're an AI or a robot, be honest: you're an AI assistant calling
+  on behalf of James Jarrell. Don't pretend to be human.
+- Before hanging up, repeat the confirmation back in one sentence: date, time, party size,
+  and the name. Get a clear yes.
+- Keep every turn short - one or two sentences. It's a phone call, not a speech.
+- When it's done, thank them, say a natural goodbye, and stop talking.
 """
 
 
@@ -136,6 +143,8 @@ async def parse_sms_request(text: str) -> dict:
                     "role": "user",
                     "content": f"""A text message came in requesting a phone call be placed on someone's
 behalf. Extract the real phone number to call and a clear, specific goal for that call.
+If the message is about a restaurant reservation and no name is given, the reservation is under "James Jarrell".
+Write the goal as a natural phrase that completes the sentence "I'm calling to ..." (e.g. "book a table for two at 7pm tonight under James Jarrell").
 
 If no phone number is given directly, reply with "NEED_NUMBER" as the phone field -
 do not guess a number.
@@ -188,7 +197,7 @@ async def sms_trigger(request: Request):
 
     twilio_client.messages.create(
         to=from_number, from_=TRIGGER_PHONE_NUMBER,
-        body=f"On it - calling {parsed['to']} now. I'll text you the result when it's done.",
+        body=f"On it. Calling {parsed['to']} now - I'll text you the result as soon as the call ends. - Echo",
     )
     return PlainTextResponse("", media_type="application/xml")
 
@@ -230,6 +239,7 @@ async def handle_media_stream(websocket: WebSocket):
             "type": "session.update",
             "session": {
                 "turn_detection": {"type": "server_vad"},
+                "input_audio_transcription": {"model": "whisper-1"},
                 "input_audio_format": "g711_ulaw",
                 "output_audio_format": "g711_ulaw",
                 "voice": VOICE,
@@ -289,7 +299,7 @@ async def finish_call(call_sid: str, transcript_lines: list):
     if requester:
         twilio_client.messages.create(
             to=requester, from_=TRIGGER_PHONE_NUMBER,
-            body=f"Call result: {summary}",
+            body=f"Echo here. {summary}",
         )
 
 
