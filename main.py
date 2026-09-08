@@ -45,7 +45,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # used to parse freeform SMS
 PUBLIC_SERVER_URL = os.getenv("PUBLIC_SERVER_URL")  # e.g. https://your-app.up.railway.app
 
 VOICE = "alloy"
-REALTIME_MODEL = "gpt-4o-realtime-preview-2024-12-17"
+REALTIME_MODEL = "gpt-realtime"
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 app = FastAPI()
@@ -231,7 +231,7 @@ async def handle_media_stream(websocket: WebSocket):
 
     async with websockets.connect(
         f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
-        extra_headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "OpenAI-Beta": "realtime=v1"},
+        extra_headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
     ) as openai_ws:
 
         # Configure the live session with our real goal for this call
