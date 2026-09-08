@@ -235,17 +235,25 @@ async def handle_media_stream(websocket: WebSocket):
     ) as openai_ws:
 
         # Configure the live session with our real goal for this call
+        # NOTE: GA Realtime API shape - audio config nested under session.audio, not flat
         await openai_ws.send(json.dumps({
             "type": "session.update",
             "session": {
-                "turn_detection": {"type": "server_vad"},
-                "input_audio_transcription": {"model": "whisper-1"},
-                "input_audio_format": "g711_ulaw",
-                "output_audio_format": "g711_ulaw",
-                "voice": VOICE,
+                "type": "realtime",
+                "output_modalities": ["text", "audio"],
                 "instructions": build_system_prompt(goal),
-                "modalities": ["text", "audio"],
                 "temperature": 0.8,
+                "audio": {
+                    "input": {
+                        "format": {"type": "audio/pcmu"},
+                        "turn_detection": {"type": "server_vad"},
+                        "transcription": {"model": "whisper-1"},
+                    },
+                    "output": {
+                        "format": {"type": "audio/pcmu"},
+                        "voice": VOICE,
+                    },
+                },
             }
         }))
 
@@ -267,7 +275,9 @@ async def handle_media_stream(websocket: WebSocket):
         async def openai_to_twilio():
             async for message in openai_ws:
                 data = json.loads(message)
-                if data.get("type") == "response.audio.delta" and stream_sid:
+                event_type = data.get("type", "")
+                # GA event names: response.output_audio.delta / response.output_audio_transcript.delta+done
+                if event_type in ("response.audio.delta", "response.output_audio.delta") and stream_sid:
                     await websocket.send_json({
                         "event": "media",
                         "streamSid": stream_sid,
@@ -275,10 +285,17 @@ async def handle_media_stream(websocket: WebSocket):
                     })
                 # Real transcript capture - this is what lets us text back an actual
                 # summary instead of just "call finished"
-                elif data.get("type") == "response.audio_transcript.done":
+                elif event_type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
                     transcript_lines.append(f"Agent: {data.get('transcript', '')}")
-                elif data.get("type") == "conversation.item.input_audio_transcription.completed":
+                elif event_type == "conversation.item.input_audio_transcription.completed":
                     transcript_lines.append(f"Them: {data.get('transcript', '')}")
+                elif event_type == "error":
+                    print(f"[OPENAI ERROR] {json.dumps(data)}")
+                elif event_type == "session.updated":
+                    print(f"[SESSION CONFIRMED] {json.dumps(data.get('session', {}))}")
+                elif event_type not in ("response.done", "response.created", "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "conversation.item.created", "rate_limits.updated", "output_audio_buffer.started", "output_audio_buffer.stopped"):
+                    # Catch-all: log anything unrecognized so silent failures show up in logs instead of dead air
+                    print(f"[UNHANDLED EVENT] {event_type}: {json.dumps(data)[:500]}")
 
         try:
             await asyncio.gather(twilio_to_openai(), openai_to_twilio())
