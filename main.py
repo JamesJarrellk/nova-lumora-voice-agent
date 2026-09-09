@@ -209,8 +209,11 @@ async def twiml_endpoint(request: Request):
     goal_encoded = request.query_params.get("goal", "")
     response = VoiceResponse()
     connect = Connect()
-    stream_url = f"{PUBLIC_SERVER_URL.replace('https://', 'wss://')}/media-stream?goal={goal_encoded}"
-    connect.stream(url=stream_url)
+    stream_url = f"{PUBLIC_SERVER_URL.replace('https://', 'wss://')}/media-stream"
+    stream = connect.stream(url=stream_url)
+    # Twilio strips query params from Media Stream URLs - custom Parameters are
+    # the real, documented way to pass data. They arrive in the 'start' event.
+    stream.parameter(name="goal", value=goal_encoded)
     response.append(connect)
     return PlainTextResponse(str(response), media_type="application/xml")
 
@@ -222,12 +225,25 @@ async def handle_media_stream(websocket: WebSocket):
     This is the actual "phone call brain" - runs for the full duration of the call.
     """
     await websocket.accept()
-    goal_encoded = websocket.query_params.get("goal", "")
-    goal = base64.urlsafe_b64decode(goal_encoded).decode() if goal_encoded else "Have a helpful conversation."
 
     stream_sid = None
     call_sid = None
+    goal = "Have a helpful conversation."
     transcript_lines = []  # real, running transcript of what the AI actually said during the call
+
+    # Twilio sends 'connected' then 'start' before any audio. The 'start' event
+    # carries our custom Parameters (the goal) - query params get stripped by Twilio,
+    # so we MUST wait for start before we know what this call is for.
+    while stream_sid is None:
+        message = await websocket.receive_text()
+        data = json.loads(message)
+        if data.get("event") == "start":
+            stream_sid = data["start"]["streamSid"]
+            call_sid = data["start"].get("callSid")
+            goal_encoded = data["start"].get("customParameters", {}).get("goal", "")
+            if goal_encoded:
+                goal = base64.urlsafe_b64decode(goal_encoded).decode()
+            print(f"[CALL START] {call_sid} goal: {goal}")
 
     async with websockets.connect(
         f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
@@ -260,10 +276,7 @@ async def handle_media_stream(websocket: WebSocket):
             nonlocal stream_sid, call_sid
             async for message in websocket.iter_text():
                 data = json.loads(message)
-                if data["event"] == "start":
-                    stream_sid = data["start"]["streamSid"]
-                    call_sid = data["start"].get("callSid")
-                elif data["event"] == "media":
+                if data["event"] == "media":
                     await openai_ws.send(json.dumps({
                         "type": "input_audio_buffer.append",
                         "audio": data["media"]["payload"],
