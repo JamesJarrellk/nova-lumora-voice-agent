@@ -240,9 +240,8 @@ async def handle_media_stream(websocket: WebSocket):
             "type": "session.update",
             "session": {
                 "type": "realtime",
-                "output_modalities": ["text", "audio"],
+                "output_modalities": ["audio"],
                 "instructions": build_system_prompt(goal),
-                "temperature": 0.8,
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
