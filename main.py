@@ -46,6 +46,7 @@ PUBLIC_SERVER_URL = os.getenv("PUBLIC_SERVER_URL")  # e.g. https://your-app.up.r
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "")  # James's real callback number for reservations
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")  # James's real email if a booking needs one
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")  # for business name -> phone number lookup
+VEHICLE_INFO = os.getenv("VEHICLE_INFO", "")  # James's truck - year/make/model/mileage for service appointments
 VOX_API_KEY = os.getenv("VOX_API_KEY", "")  # if set, /call requires X-Vox-Key header - blocks strangers from placing calls on our Twilio
 
 VOICE = "alloy"
@@ -127,6 +128,7 @@ FACTS YOU HAVE ON HAND (use these EXACTLY - never make up different ones):
   ask for a phone number - NOT the number you're calling from.
 - Email if they need one to hold the booking: {CONTACT_EMAIL}
 - The name is "James Jarrell" - spelled J-A-R-R-E-L-L if they ask.
+- James's vehicle, if this call is about auto service: {VEHICLE_INFO if VEHICLE_INFO else "(not on file - if they need vehicle details not in your goal, say James will confirm them at drop-off)"}
 - If asked who you are or whether you're an AI: be honest and natural - you're Echo,
   James Jarrell's AI assistant, and James asked you to make this booking for him.
   Say it once, confidently, and get back to the booking.
@@ -153,8 +155,10 @@ How to handle the call:
   Before hanging up, get the total price and the ready time, then repeat the full order back
   AS A QUESTION and get a clear yes. Only after they confirm do you say goodbye - never
   stack the confirmation and the goodbye into one breath.
-- IF THIS IS A RESERVATION: have the details ready and give them clearly when asked -
-  party size, date, time, and the name is "James Jarrell" unless the goal says otherwise.
+- IF THIS IS A RESERVATION OR AN APPOINTMENT (restaurant, auto service, or similar):
+  have the details ready and give them clearly when asked - date, time, the name, and
+  what's needed (for restaurants: party size; for auto service: the vehicle and every
+  service listed in your goal, including any concerns to have checked).
   If the requested time isn't available, ask for the closest available times and accept the
   nearest reasonable option within about an hour of the request. Say what you booked.
   Before hanging up, repeat the confirmation back in one sentence: date, time, party size,
@@ -230,7 +234,10 @@ If no name is given for a reservation or pickup, the name is "James Jarrell".
 Write the goal as a natural phrase that completes the sentence "I'm calling to ..." (e.g. "book a
 table for two at 7pm tonight under James Jarrell" or "order a large cheese pizza for pickup at
 12pm under the name James Jarrell").
-For food orders, include every detail given: items, sizes, quantities, pickup time, and the name.
+Include EVERY detail given, whatever the request type: items, sizes, quantities, times,
+services requested (e.g. oil change, tire rotation, brake inspection), vehicle info
+(year/make/model/mileage), party sizes, special requests, and the name. Details the
+caller will need must survive into the goal - never compress them away.
 
 If no phone number is given directly but a business name and location are (e.g. "the Papa John's
 in Pleasant View TN"), set "to" to "NEED_LOOKUP" and put the business name + location in
