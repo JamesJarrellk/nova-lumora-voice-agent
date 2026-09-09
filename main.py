@@ -43,6 +43,8 @@ TRIGGER_PHONE_NUMBER = os.getenv("TRIGGER_PHONE_NUMBER")  # the dormant number p
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # used to parse freeform SMS requests
 PUBLIC_SERVER_URL = os.getenv("PUBLIC_SERVER_URL")  # e.g. https://your-app.up.railway.app
+CONTACT_PHONE = os.getenv("CONTACT_PHONE", "")  # James's real callback number for reservations
+CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")  # James's real email if a booking needs one
 
 VOICE = "alloy"
 REALTIME_MODEL = "gpt-realtime"
@@ -70,11 +72,22 @@ OPEN THE CALL LIKE THIS (adapt to how they answer, but keep the substance):
 
 Your goal for this call: {goal}
 
+FACTS YOU HAVE ON HAND (use these EXACTLY - never make up different ones):
+- Contact phone number for the reservation: {CONTACT_PHONE}. Give THIS number if they
+  ask for a phone number - NOT the number you're calling from.
+- Email if they need one to hold the booking: {CONTACT_EMAIL}
+- The name is "James Jarrell" - spelled J-A-R-R-E-L-L if they ask.
+- If asked who you are or whether you're an AI: be honest and natural - you're Echo,
+  James Jarrell's AI assistant, and James asked you to make this booking for him.
+  Say it once, confidently, and get back to the booking.
+- If they ask for ANYTHING not listed here or in your goal (a card number, a decision,
+  special requests you weren't given): do NOT invent an answer. Say James will follow
+  up directly, and continue with what you CAN complete.
+
 How to handle the call:
 - Wait for them to greet you before you speak. Then give the opening line above.
 - Have the details ready and give them clearly when asked: party size, date, time,
   and the name the reservation is under is "James Jarrell" unless the goal says otherwise.
-- If they ask for a phone number for the reservation, give the number you're calling from.
 - If the requested time isn't available, ask what the closest available times are and
   accept the nearest reasonable option within about an hour of the request. Say what you booked.
 - If they need something you don't have (an email, a card to hold the table, a decision
