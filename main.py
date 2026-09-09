@@ -62,6 +62,53 @@ active_call_requesters = {}
 completed_calls = set()  # finish_call runs at most once per call (stop event + disconnect can both fire)
 
 
+
+# ---- DTMF: real touch-tone synthesis so Echo can navigate phone menus ----
+import math
+
+DTMF_FREQS = {
+    "1": (697, 1209), "2": (697, 1336), "3": (697, 1477),
+    "4": (770, 1209), "5": (770, 1336), "6": (770, 1477),
+    "7": (852, 1209), "8": (852, 1336), "9": (852, 1477),
+    "*": (941, 1209), "0": (941, 1336), "#": (941, 1477),
+}
+
+def _lin2ulaw(sample: int) -> int:
+    """Standard G.711 mu-law encoder (audioop was removed in Python 3.13)."""
+    BIAS, CLIP = 0x84, 32635
+    sign = 0x80 if sample < 0 else 0
+    if sample < 0:
+        sample = -sample
+    if sample > CLIP:
+        sample = CLIP
+    sample += BIAS
+    exponent = 7
+    mask = 0x4000
+    while exponent > 0 and not (sample & mask):
+        exponent -= 1
+        mask >>= 1
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    return ~(sign | (exponent << 4) | mantissa) & 0xFF
+
+def dtmf_ulaw_frames(digits: str, tone_ms: int = 250, gap_ms: int = 120):
+    """Yield base64-encoded 20ms mu-law frames playing each digit's dual tone."""
+    rate = 8000
+    for d in digits:
+        if d not in DTMF_FREQS:
+            continue
+        f1, f2 = DTMF_FREQS[d]
+        n_tone = int(rate * tone_ms / 1000)
+        n_gap = int(rate * gap_ms / 1000)
+        pcm = bytearray()
+        for i in range(n_tone):
+            t = i / rate
+            s = int(0.35 * 32767 * (math.sin(2 * math.pi * f1 * t) + math.sin(2 * math.pi * f2 * t)) / 2)
+            pcm.append(_lin2ulaw(s))
+        pcm.extend(_lin2ulaw(0) for _ in range(n_gap))
+        for off in range(0, len(pcm), 160):  # 160 bytes = 20ms at 8kHz
+            yield base64.b64encode(bytes(pcm[off:off + 160])).decode()
+
+
 def build_system_prompt(goal: str) -> str:
     """
     The real instructions the AI follows during the live call.
@@ -92,6 +139,14 @@ How to handle the call:
 - Speak at a relaxed, natural pace - never rushed. After you ask a question, STOP and
   wait for their answer before continuing.
 - If they start speaking while you're talking, stop immediately and listen.
+- IF AN AUTOMATED PHONE SYSTEM (IVR) ANSWERS instead of a person: do NOT introduce
+  yourself to the machine. Listen to the full menu silently. If it says "press a number",
+  use your send_dtmf tool with that digit. If it asks you to SPEAK a choice, answer with
+  only the short keyword ("carryout", "representative"). Always prefer any path to a live
+  person - pressing 0 or saying "representative" often works. Once a HUMAN answers, then
+  give your normal opening line. If after several attempts you cannot reach a person or
+  place the order, say nothing more and end the call - the summary must honestly say the
+  order was not placed.
 - IF THIS IS A FOOD ORDER: state the order clearly (items, sizes, quantities), say it's for
   pickup and give the pickup time and the name. Payment will be handled at pickup - if they
   require payment over the phone, say James will call back to pay and confirm what you CAN.
@@ -367,6 +422,17 @@ async def handle_media_stream(websocket: WebSocket):
             "session": {
                 "type": "realtime",
                 "output_modalities": ["audio"],
+                "tools": [{
+                    "type": "function",
+                    "name": "send_dtmf",
+                    "description": "Press phone keypad buttons to navigate an automated menu. Use when the phone system says 'press 1' etc.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"digits": {"type": "string", "description": "The digits to press, e.g. '1' or '0'"}},
+                        "required": ["digits"],
+                    },
+                }],
+                "tool_choice": "auto",
                 "instructions": build_system_prompt(goal),
                 "audio": {
                     "input": {
@@ -421,6 +487,27 @@ async def handle_media_stream(websocket: WebSocket):
                             transcript_lines.append(line)
                 elif event_type == "conversation.item.input_audio_transcription.completed":
                     transcript_lines.append(f"Them: {data.get('transcript', '')}")
+                # Echo pressed a keypad button: synthesize real DTMF audio into the call
+                elif event_type == "response.function_call_arguments.done":
+                    try:
+                        args = json.loads(data.get("arguments", "{}"))
+                        digits = args.get("digits", "")
+                        print(f"[DTMF] pressing: {digits}")
+                        if stream_sid:
+                            for frame in dtmf_ulaw_frames(digits):
+                                await websocket.send_json({
+                                    "event": "media", "streamSid": stream_sid,
+                                    "media": {"payload": frame},
+                                })
+                        await openai_ws.send(json.dumps({
+                            "type": "conversation.item.create",
+                            "item": {"type": "function_call_output",
+                                     "call_id": data.get("call_id"),
+                                     "output": json.dumps({"status": "pressed", "digits": digits})},
+                        }))
+                        await openai_ws.send(json.dumps({"type": "response.create"}))
+                    except Exception as e:
+                        print(f"[DTMF FAILED] {e}")
                 # Barge-in: caller started talking while Echo may be mid-sentence.
                 # Cancel the in-flight response AND flush Twilio's buffered audio -
                 # without the clear, Twilio keeps playing seconds of queued speech.
@@ -436,7 +523,7 @@ async def handle_media_stream(websocket: WebSocket):
                         print(f"[OPENAI ERROR] {err}")
                 elif event_type == "session.updated":
                     print(f"[SESSION CONFIRMED] {json.dumps(data.get('session', {}))}")
-                elif event_type not in ("response.done", "response.created", "input_audio_buffer.speech_stopped", "input_audio_buffer.committed", "conversation.item.created", "conversation.item.added", "conversation.item.done", "conversation.item.input_audio_transcription.delta", "response.output_item.added", "response.output_item.done", "response.content_part.added", "response.output_audio.done", "response.output_audio_transcript.delta", "rate_limits.updated", "output_audio_buffer.started", "output_audio_buffer.stopped", "output_audio_buffer.cleared"):
+                elif event_type not in ("response.done", "response.created", "input_audio_buffer.speech_stopped", "input_audio_buffer.committed", "conversation.item.created", "conversation.item.added", "conversation.item.done", "conversation.item.input_audio_transcription.delta", "response.output_item.added", "response.output_item.done", "response.content_part.added", "response.output_audio.done", "response.output_audio_transcript.delta", "response.function_call_arguments.delta", "rate_limits.updated", "output_audio_buffer.started", "output_audio_buffer.stopped", "output_audio_buffer.cleared"):
                     # Catch-all: log anything unrecognized so silent failures show up in logs instead of dead air
                     print(f"[UNHANDLED EVENT] {event_type}: {json.dumps(data)[:500]}")
 
