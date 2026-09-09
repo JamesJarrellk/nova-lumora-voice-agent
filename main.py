@@ -45,6 +45,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")  # used to parse freeform SMS
 PUBLIC_SERVER_URL = os.getenv("PUBLIC_SERVER_URL")  # e.g. https://your-app.up.railway.app
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "")  # James's real callback number for reservations
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")  # James's real email if a booking needs one
+GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")  # for business name -> phone number lookup
 
 VOICE = "alloy"
 REALTIME_MODEL = "gpt-realtime"
@@ -86,16 +87,20 @@ FACTS YOU HAVE ON HAND (use these EXACTLY - never make up different ones):
 
 How to handle the call:
 - Wait for them to greet you before you speak. Then give the opening line above.
-- Have the details ready and give them clearly when asked: party size, date, time,
-  and the name the reservation is under is "James Jarrell" unless the goal says otherwise.
-- If the requested time isn't available, ask what the closest available times are and
-  accept the nearest reasonable option within about an hour of the request. Say what you booked.
+- IF THIS IS A FOOD ORDER: state the order clearly (items, sizes, quantities), say it's for
+  pickup and give the pickup time and the name. Payment will be handled at pickup - if they
+  require payment over the phone, say James will call back to pay and confirm what you CAN.
+  Before hanging up, get the total price and the ready time, and repeat the full order back.
+- IF THIS IS A RESERVATION: have the details ready and give them clearly when asked -
+  party size, date, time, and the name is "James Jarrell" unless the goal says otherwise.
+  If the requested time isn't available, ask for the closest available times and accept the
+  nearest reasonable option within about an hour of the request. Say what you booked.
+  Before hanging up, repeat the confirmation back in one sentence: date, time, party size,
+  and the name. Get a clear yes.
 - If they need something you don't have (an email, a card to hold the table, a decision
   outside your goal), say you'll have James follow up directly and get the best next step.
 - If asked whether you're an AI or a robot, be honest: you're an AI assistant calling
   on behalf of James Jarrell. Don't pretend to be human.
-- Before hanging up, repeat the confirmation back in one sentence: date, time, party size,
-  and the name. Get a clear yes.
 - Keep every turn short - one or two sentences. It's a phone call, not a speech.
 - When it's done, thank them, say a natural goodbye, and stop talking.
 """
@@ -155,15 +160,22 @@ async def parse_sms_request(text: str) -> dict:
                 "messages": [{
                     "role": "user",
                     "content": f"""A text message came in requesting a phone call be placed on someone's
-behalf. Extract the real phone number to call and a clear, specific goal for that call.
-If the message is about a restaurant reservation and no name is given, the reservation is under "James Jarrell".
-Write the goal as a natural phrase that completes the sentence "I'm calling to ..." (e.g. "book a table for two at 7pm tonight under James Jarrell").
+behalf (a restaurant reservation, a food order for pickup, or similar). Extract the phone number
+to call and a clear, specific goal for that call.
+If no name is given for a reservation or pickup, the name is "James Jarrell".
+Write the goal as a natural phrase that completes the sentence "I'm calling to ..." (e.g. "book a
+table for two at 7pm tonight under James Jarrell" or "order a large cheese pizza for pickup at
+12pm under the name James Jarrell").
+For food orders, include every detail given: items, sizes, quantities, pickup time, and the name.
 
-If no phone number is given directly, reply with "NEED_NUMBER" as the phone field -
-do not guess a number.
+If no phone number is given directly but a business name and location are (e.g. "the Papa John's
+in Pleasant View TN"), set "to" to "NEED_LOOKUP" and put the business name + location in
+"business_query" (e.g. "Papa John's Pleasant View TN").
+If neither a number nor a findable business name+location is given, set "to" to "NEED_NUMBER".
+Never guess a phone number.
 
 Reply with ONLY valid JSON, nothing else, in this exact format:
-{{"to": "+1XXXXXXXXXX", "goal": "clear instructions for what the call should accomplish"}}
+{{"to": "+1XXXXXXXXXX or NEED_LOOKUP or NEED_NUMBER", "business_query": "business name and location, or empty string", "goal": "clear instructions for what the call should accomplish"}}
 
 MESSAGE: {text}"""
                 }],
@@ -172,6 +184,34 @@ MESSAGE: {text}"""
         data = resp.json()
         raw = data["content"][-1]["text"].strip()
         return json.loads(raw)
+
+
+async def lookup_business_number(business_query: str) -> str:
+    """
+    Real business lookup: 'Papa John's Pleasant View TN' -> '+16153824444'.
+    Uses Google Places Text Search (new API). Returns E.164 number or '' if not found.
+    """
+    if not GOOGLE_PLACES_API_KEY:
+        return ""
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(
+            "https://places.googleapis.com/v1/places:searchText",
+            headers={
+                "Content-Type": "application/json",
+                "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
+                "X-Goog-FieldMask": "places.displayName,places.internationalPhoneNumber,places.formattedAddress",
+            },
+            json={"textQuery": business_query, "maxResultCount": 1},
+        )
+        data = resp.json()
+        places = data.get("places", [])
+        if not places:
+            print(f"[LOOKUP] No results for: {business_query}")
+            return ""
+        place = places[0]
+        phone = place.get("internationalPhoneNumber", "")
+        print(f"[LOOKUP] {business_query} -> {place.get('displayName', {}).get('text', '?')} @ {place.get('formattedAddress', '?')} -> {phone}")
+        return phone.replace(" ", "").replace("-", "")
 
 
 @app.post("/sms-trigger")
@@ -193,6 +233,23 @@ async def sms_trigger(request: Request):
             body="Couldn't understand that request. Try: 'Call [business] at [phone number] and [what you need].'",
         )
         return PlainTextResponse("", media_type="application/xml")
+
+    if parsed.get("to") == "NEED_LOOKUP":
+        found = await lookup_business_number(parsed.get("business_query", ""))
+        if found:
+            parsed["to"] = found
+        elif not GOOGLE_PLACES_API_KEY:
+            twilio_client.messages.create(
+                to=from_number, from_=TRIGGER_PHONE_NUMBER,
+                body="I can't look up business numbers yet - text me the phone number and I'll make the call.",
+            )
+            return PlainTextResponse("", media_type="application/xml")
+        else:
+            twilio_client.messages.create(
+                to=from_number, from_=TRIGGER_PHONE_NUMBER,
+                body=f"Couldn't find a listing for '{parsed.get('business_query', '')}'. Text me the phone number and I'll make the call.",
+            )
+            return PlainTextResponse("", media_type="application/xml")
 
     if parsed.get("to") == "NEED_NUMBER":
         twilio_client.messages.create(
