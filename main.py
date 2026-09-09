@@ -261,6 +261,8 @@ async def sms_trigger(request: Request):
     call = twilio_client.calls.create(
         to=parsed["to"], from_=TWILIO_PHONE_NUMBER,
         url=f"{PUBLIC_SERVER_URL}/twiml?goal={base64.urlsafe_b64encode(parsed['goal'].encode()).decode()}",
+        status_callback=f"{PUBLIC_SERVER_URL}/call-status",
+        status_callback_event=["completed"],
     )
     active_call_goals[call.sid] = parsed["goal"]
     active_call_requesters[call.sid] = from_number  # remember who to text the result back to
@@ -269,6 +271,35 @@ async def sms_trigger(request: Request):
         to=from_number, from_=TRIGGER_PHONE_NUMBER,
         body=f"On it. Calling {parsed['to']} now - I'll text you the result as soon as the call ends. - Echo",
     )
+    return PlainTextResponse("", media_type="application/xml")
+
+
+@app.post("/call-status")
+async def call_status(request: Request):
+    """
+    Twilio posts here when a call reaches a final state. Catches the calls that
+    NEVER connected (no-answer, busy, failed, canceled) - those never open a
+    media stream, so finish_call never runs and the requester would otherwise
+    hear nothing. This closes that loop with an honest status text.
+    """
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    call_status_value = form.get("CallStatus", "")
+    to_number = form.get("To", "")
+
+    if call_status_value in ("no-answer", "busy", "failed", "canceled"):
+        requester = active_call_requesters.get(call_sid)
+        if requester:
+            reasons = {
+                "no-answer": f"No answer at {to_number} - they didn't pick up.",
+                "busy": f"{to_number} was busy.",
+                "failed": f"The call to {to_number} couldn't go through - double-check the number.",
+                "canceled": f"The call to {to_number} was canceled before it connected.",
+            }
+            twilio_client.messages.create(
+                to=requester, from_=TRIGGER_PHONE_NUMBER,
+                body=f"Echo here. {reasons[call_status_value]} Text me again to retry.",
+            )
     return PlainTextResponse("", media_type="application/xml")
 
 
