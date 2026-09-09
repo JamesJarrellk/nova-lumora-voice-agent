@@ -46,6 +46,7 @@ PUBLIC_SERVER_URL = os.getenv("PUBLIC_SERVER_URL")  # e.g. https://your-app.up.r
 CONTACT_PHONE = os.getenv("CONTACT_PHONE", "")  # James's real callback number for reservations
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")  # James's real email if a booking needs one
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")  # for business name -> phone number lookup
+VOX_API_KEY = os.getenv("VOX_API_KEY", "")  # if set, /call requires X-Vox-Key header - blocks strangers from placing calls on our Twilio
 
 VOICE = "alloy"
 REALTIME_MODEL = "gpt-realtime"
@@ -58,6 +59,7 @@ app = FastAPI()
 # history across restarts, log everything to Airtable (see log_call_result).
 active_call_goals = {}
 active_call_requesters = {}
+completed_calls = set()  # finish_call runs at most once per call (stop event + disconnect can both fire)
 
 
 def build_system_prompt(goal: str) -> str:
@@ -87,10 +89,15 @@ FACTS YOU HAVE ON HAND (use these EXACTLY - never make up different ones):
 
 How to handle the call:
 - Wait for them to greet you before you speak. Then give the opening line above.
+- Speak at a relaxed, natural pace - never rushed. After you ask a question, STOP and
+  wait for their answer before continuing.
+- If they start speaking while you're talking, stop immediately and listen.
 - IF THIS IS A FOOD ORDER: state the order clearly (items, sizes, quantities), say it's for
   pickup and give the pickup time and the name. Payment will be handled at pickup - if they
   require payment over the phone, say James will call back to pay and confirm what you CAN.
-  Before hanging up, get the total price and the ready time, and repeat the full order back.
+  Before hanging up, get the total price and the ready time, then repeat the full order back
+  AS A QUESTION and get a clear yes. Only after they confirm do you say goodbye - never
+  stack the confirmation and the goodbye into one breath.
 - IF THIS IS A RESERVATION: have the details ready and give them clearly when asked -
   party size, date, time, and the name is "James Jarrell" unless the goal says otherwise.
   If the requested time isn't available, ask for the closest available times and accept the
@@ -123,6 +130,8 @@ async def place_call(request: Request):
         "goal": "Book a table for 2 at 7:30pm tonight under the name James"
     }
     """
+    if VOX_API_KEY and request.headers.get("x-vox-key") != VOX_API_KEY:
+        return {"error": "unauthorized"}
     body = await request.json()
     to_number = body["to"]
     goal = body.get("goal", "Confirm you've reached the business and ask how you can help.")
@@ -146,7 +155,7 @@ async def parse_sms_request(text: str) -> dict:
     Uses Claude (same model this whole system was built with) since it's
     genuinely better at flexible, freeform parsing than rigid regex rules.
     """
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -193,7 +202,7 @@ async def lookup_business_number(business_query: str) -> str:
     """
     if not GOOGLE_PLACES_API_KEY:
         return ""
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             "https://places.googleapis.com/v1/places:searchText",
             headers={
@@ -399,14 +408,35 @@ async def handle_media_stream(websocket: WebSocket):
                 # Real transcript capture - this is what lets us text back an actual
                 # summary instead of just "call finished"
                 elif event_type in ("response.audio_transcript.done", "response.output_audio_transcript.done"):
-                    transcript_lines.append(f"Agent: {data.get('transcript', '')}")
+                    line = f"Agent: {data.get('transcript', '')}"
+                    if not transcript_lines or transcript_lines[-1] != line:
+                        transcript_lines.append(line)
+                # GA reliably finalizes the spoken text here even when the .done
+                # transcript event doesn't fire - belt and suspenders, deduped
+                elif event_type == "response.content_part.done":
+                    part = data.get("part", {})
+                    if part.get("type") == "audio" and part.get("transcript"):
+                        line = f"Agent: {part['transcript']}"
+                        if not transcript_lines or transcript_lines[-1] != line:
+                            transcript_lines.append(line)
                 elif event_type == "conversation.item.input_audio_transcription.completed":
                     transcript_lines.append(f"Them: {data.get('transcript', '')}")
+                # Barge-in: caller started talking while Echo may be mid-sentence.
+                # Cancel the in-flight response AND flush Twilio's buffered audio -
+                # without the clear, Twilio keeps playing seconds of queued speech.
+                elif event_type == "input_audio_buffer.speech_started":
+                    await openai_ws.send(json.dumps({"type": "response.cancel"}))
+                    if stream_sid:
+                        await websocket.send_json({"event": "clear", "streamSid": stream_sid})
                 elif event_type == "error":
-                    print(f"[OPENAI ERROR] {json.dumps(data)}")
+                    err = json.dumps(data)
+                    if "cancel" in err and "no active response" in err.lower():
+                        pass  # expected when we cancel with nothing in flight
+                    else:
+                        print(f"[OPENAI ERROR] {err}")
                 elif event_type == "session.updated":
                     print(f"[SESSION CONFIRMED] {json.dumps(data.get('session', {}))}")
-                elif event_type not in ("response.done", "response.created", "input_audio_buffer.speech_started", "input_audio_buffer.speech_stopped", "conversation.item.created", "rate_limits.updated", "output_audio_buffer.started", "output_audio_buffer.stopped"):
+                elif event_type not in ("response.done", "response.created", "input_audio_buffer.speech_stopped", "input_audio_buffer.committed", "conversation.item.created", "conversation.item.added", "conversation.item.done", "conversation.item.input_audio_transcription.delta", "response.output_item.added", "response.output_item.done", "response.content_part.added", "response.output_audio.done", "response.output_audio_transcript.delta", "rate_limits.updated", "output_audio_buffer.started", "output_audio_buffer.stopped", "output_audio_buffer.cleared"):
                     # Catch-all: log anything unrecognized so silent failures show up in logs instead of dead air
                     print(f"[UNHANDLED EVENT] {event_type}: {json.dumps(data)[:500]}")
 
@@ -420,17 +450,35 @@ async def finish_call(call_sid: str, transcript_lines: list):
     """
     Real wrap-up when a call ends: summarize what actually happened using the
     real transcript, log it, and text the result back to whoever requested it.
+    Hardened: runs at most once per call, ALWAYS sends a text even if the
+    summary API fails, and a text-send failure can't crash anything else.
     """
+    if call_sid in completed_calls:
+        return
+    completed_calls.add(call_sid)
+
     full_transcript = "\n".join(transcript_lines) if transcript_lines else "(no transcript captured)"
-    summary = await summarize_call(full_transcript)
+    try:
+        summary = await summarize_call(full_transcript)
+    except Exception as e:
+        # The summary is a nice-to-have. The confirmation text is NOT.
+        # Fall back to Echo's own last confirmation line from the call.
+        print(f"[SUMMARY FAILED] {e} - falling back to raw transcript line")
+        agent_lines = [l for l in transcript_lines if l.startswith("Agent:")]
+        summary = (agent_lines[-1].replace("Agent: ", "", 1)
+                   if agent_lines else "Call finished - I couldn't generate a summary, check Railway logs for the transcript.")
+
     await log_call_result(call_sid, summary, full_transcript)
 
     requester = active_call_requesters.get(call_sid)
     if requester:
-        twilio_client.messages.create(
-            to=requester, from_=TRIGGER_PHONE_NUMBER,
-            body=f"Echo here. {summary}",
-        )
+        try:
+            twilio_client.messages.create(
+                to=requester, from_=TRIGGER_PHONE_NUMBER,
+                body=f"Echo here. {summary}",
+            )
+        except Exception as e:
+            print(f"[RESULT TEXT FAILED] {e}")
 
 
 async def summarize_call(transcript: str) -> str:
@@ -438,7 +486,7 @@ async def summarize_call(transcript: str) -> str:
     from the real captured transcript - not a guess."""
     if transcript == "(no transcript captured)":
         return "Call completed, but no transcript was captured - check Railway logs for details."
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30.0) as client:
         resp = await client.post(
             "https://api.anthropic.com/v1/messages",
             headers={
