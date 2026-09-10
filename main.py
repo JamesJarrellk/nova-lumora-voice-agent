@@ -50,7 +50,7 @@ VEHICLE_INFO = os.getenv("VEHICLE_INFO", "")  # James's truck - year/make/model/
 VOX_API_KEY = os.getenv("VOX_API_KEY", "")  # if set, /call requires X-Vox-Key header - blocks strangers from placing calls on our Twilio
 
 VOICE = "alloy"
-REALTIME_MODEL = "gpt-realtime"
+REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime")  # set to "gpt-realtime-mini" to cut audio cost ~3x
 
 twilio_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 app = FastAPI()
@@ -285,6 +285,31 @@ async def lookup_business_number(business_query: str) -> str:
         return phone.replace(" ", "").replace("-", "")
 
 
+import hmac as _hmac
+import hashlib as _hashlib
+
+def check_twilio_signature(request, form) -> bool:
+    """
+    Validates X-Twilio-Signature (HMAC-SHA1 of URL + sorted form params, keyed by
+    the auth token). LOG-ONLY for now: we flag failures in logs without blocking,
+    to prove the math matches our proxy setup before enforcing.
+    """
+    try:
+        sig = request.headers.get("x-twilio-signature", "")
+        url = f"{PUBLIC_SERVER_URL}{request.url.path}"
+        payload = url + "".join(k + form[k] for k in sorted(form.keys()))
+        expected = base64.b64encode(
+            _hmac.new(TWILIO_AUTH_TOKEN.encode(), payload.encode(), _hashlib.sha1).digest()
+        ).decode()
+        if not _hmac.compare_digest(expected, sig):
+            print(f"[SIG FAIL] {request.url.path} - signature mismatch (log-only, not blocking)")
+            return False
+        return True
+    except Exception as e:
+        print(f"[SIG CHECK ERROR] {e}")
+        return False
+
+
 @app.post("/sms-trigger")
 async def sms_trigger(request: Request):
     """
@@ -293,6 +318,7 @@ async def sms_trigger(request: Request):
     once the call finishes - texts back a real status update to whoever asked.
     """
     form = await request.form()
+    check_twilio_signature(request, dict(form))
     from_number = form.get("From")
     body = form.get("Body", "")
 
@@ -354,6 +380,7 @@ async def call_status(request: Request):
     hear nothing. This closes that loop with an honest status text.
     """
     form = await request.form()
+    check_twilio_signature(request, dict(form))
     call_sid = form.get("CallSid")
     call_status_value = form.get("CallStatus", "")
     to_number = form.get("To", "")
@@ -466,6 +493,7 @@ async def handle_media_stream(websocket: WebSocket):
                     }))
                 elif data["event"] == "stop":
                     await finish_call(call_sid, transcript_lines)
+                    return  # call is over - exit so the OpenAI session gets closed, not leaked
 
         async def openai_to_twilio():
             async for message in openai_ws:
@@ -534,10 +562,23 @@ async def handle_media_stream(websocket: WebSocket):
                     # Catch-all: log anything unrecognized so silent failures show up in logs instead of dead air
                     print(f"[UNHANDLED EVENT] {event_type}: {json.dumps(data)[:500]}")
 
+        t1 = asyncio.create_task(twilio_to_openai())
+        t2 = asyncio.create_task(openai_to_twilio())
         try:
-            await asyncio.gather(twilio_to_openai(), openai_to_twilio())
-        except WebSocketDisconnect:
+            # First side to finish (call ended / socket dropped) wins; cancel the other
+            # so we never hold an idle OpenAI session open until its 60-minute cap.
+            done, pending = await asyncio.wait({t1, t2}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            for task in done:
+                exc = task.exception()
+                if exc and not isinstance(exc, (WebSocketDisconnect, asyncio.CancelledError)):
+                    print(f"[BRIDGE ERROR] {exc}")
+        finally:
             await finish_call(call_sid, transcript_lines)
+            # Fix 2: don't let per-call state accumulate forever
+            active_call_goals.pop(call_sid, None)
+            active_call_requesters.pop(call_sid, None)
 
 
 async def finish_call(call_sid: str, transcript_lines: list):
