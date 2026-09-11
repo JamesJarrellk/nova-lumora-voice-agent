@@ -118,11 +118,18 @@ async def get_pilot_user(phone: str):
     record dict or None. If AIRTABLE_TOKEN isn't set, multi-user mode is off."""
     if not AIRTABLE_TOKEN:
         return None
+    # Match by the last 10 DIGITS, not exact text - users type "(615) 624-1201",
+    # Twilio sends "+16156241201". Formatting must never lock someone out.
+    digits = "".join(c for c in phone if c.isdigit())[-10:]
+    strip = "{Phone}"
+    for ch in ["'('", "')'", "'-'", "' '", "'+'", "'.'"]:
+        strip = f"SUBSTITUTE({strip},{ch},'')"
+    formula = f"RIGHT({strip},10)='{digits}'"
     async with httpx.AsyncClient(timeout=15.0) as client:
         resp = await client.get(
             f"https://api.airtable.com/v0/{VOX_BASE_ID}/{VOX_USERS_TABLE}",
             headers={"Authorization": f"Bearer {AIRTABLE_TOKEN}"},
-            params={"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1},
+            params={"filterByFormula": formula, "maxRecords": 1},
         )
         records = resp.json().get("records", [])
         return records[0] if records else None
@@ -410,6 +417,13 @@ async def sms_trigger(request: Request):
             return PlainTextResponse("", media_type="application/xml")
         user_fields = user.get("fields", {})
         user_record_id = user["id"]
+        expires = user_fields.get("Expires")
+        if expires and str(expires)[:10] < datetime.utcnow().strftime("%Y-%m-%d"):
+            twilio_client.messages.create(
+                to=from_number, from_=TRIGGER_PHONE_NUMBER,
+                body="Your VOX pilot access has ended. Text James if you want back in.",
+            )
+            return PlainTextResponse("", media_type="application/xml")
         used = int(user_fields.get("Calls Used") or 0)
         limit = int(user_fields.get("Call Limit") or 15)
         if used >= limit:
