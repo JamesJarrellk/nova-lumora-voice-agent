@@ -47,7 +47,10 @@ CONTACT_PHONE = os.getenv("CONTACT_PHONE", "")  # James's real callback number f
 CONTACT_EMAIL = os.getenv("CONTACT_EMAIL", "")  # James's real email if a booking needs one
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")  # for business name -> phone number lookup
 VEHICLE_INFO = os.getenv("VEHICLE_INFO", "")  # James's truck - year/make/model/mileage for service appointments
-VOX_API_KEY = os.getenv("VOX_API_KEY", "")  # if set, /call requires X-Vox-Key header - blocks strangers from placing calls on our Twilio
+VOX_API_KEY = os.getenv("VOX_API_KEY", "")
+AIRTABLE_TOKEN = os.getenv("AIRTABLE_TOKEN", "")  # PAT with data.records read+write on the VOX Pilot base
+VOX_BASE_ID = os.getenv("VOX_BASE_ID", "appXXZGZjyj9PjBZ2")
+VOX_USERS_TABLE = os.getenv("VOX_USERS_TABLE", "Users")  # if set, /call requires X-Vox-Key header - blocks strangers from placing calls on our Twilio
 
 VOICE = "alloy"
 REALTIME_MODEL = os.getenv("REALTIME_MODEL", "gpt-realtime")  # set to "gpt-realtime-mini" to cut audio cost ~3x
@@ -110,12 +113,47 @@ def dtmf_ulaw_frames(digits: str, tone_ms: int = 250, gap_ms: int = 120):
             yield base64.b64encode(bytes(pcm[off:off + 160])).decode()
 
 
-def build_system_prompt(goal: str) -> str:
+async def get_pilot_user(phone: str):
+    """Look up a pilot user by the number they texted from. Returns the Airtable
+    record dict or None. If AIRTABLE_TOKEN isn't set, multi-user mode is off."""
+    if not AIRTABLE_TOKEN:
+        return None
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        resp = await client.get(
+            f"https://api.airtable.com/v0/{VOX_BASE_ID}/{VOX_USERS_TABLE}",
+            headers={"Authorization": f"Bearer {AIRTABLE_TOKEN}"},
+            params={"filterByFormula": f"{{Phone}}='{phone}'", "maxRecords": 1},
+        )
+        records = resp.json().get("records", [])
+        return records[0] if records else None
+
+
+async def increment_calls_used(record_id: str, current: int):
+    if not AIRTABLE_TOKEN:
+        return
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            await client.patch(
+                f"https://api.airtable.com/v0/{VOX_BASE_ID}/{VOX_USERS_TABLE}/{record_id}",
+                headers={"Authorization": f"Bearer {AIRTABLE_TOKEN}",
+                         "Content-Type": "application/json"},
+                json={"fields": {"Calls Used": current + 1}},
+            )
+    except Exception as e:
+        print(f"[USAGE UPDATE FAILED] {e}")
+
+
+def build_system_prompt(goal: str, name: str = "", callback: str = "", vehicle: str = "", notes: str = "") -> str:
     """
     The real instructions the AI follows during the live call.
-    Echo introduces itself as James Jarrell's assistant and books what was asked.
+    Defaults to James; pilot users get Echo introducing itself as THEIR assistant,
+    with their callback number, vehicle, and preferences swapped in.
     """
-    return f"""You are Echo, James Jarrell's personal assistant. You are placing a real phone
+    full_name = name or "James Jarrell"
+    first_name = full_name.split()[0]
+    cb = callback or CONTACT_PHONE
+    veh = vehicle if name else (vehicle or VEHICLE_INFO)
+    prompt = f"""You are Echo, James Jarrell's personal assistant. You are placing a real phone
 call on James's behalf. Speak naturally and warmly, like a competent human assistant would.
 
 WHO YOU ARE TALKING TO - never lose track of this:
@@ -142,11 +180,11 @@ OPEN THE CALL LIKE THIS (adapt to how they answer, but keep the substance):
 Your goal for this call: {goal}
 
 FACTS YOU HAVE ON HAND (use these EXACTLY - never make up different ones):
-- Contact phone number for the reservation: {CONTACT_PHONE}. Give THIS number if they
+- Contact phone number for the reservation: {cb}. Give THIS number if they
   ask for a phone number - NOT the number you're calling from.
 - Email if they need one to hold the booking: {CONTACT_EMAIL}
-- The name is "James Jarrell" - spelled J-A-R-R-E-L-L if they ask.
-- James's vehicle, if this call is about auto service: {VEHICLE_INFO if VEHICLE_INFO else "(not on file - if they need vehicle details not in your goal, say James will confirm them at drop-off)"}
+- The name is "James Jarrell"{" - spelled " + "-".join(full_name.split()[-1].upper()) + " if they ask." if len(full_name.split()) > 1 else "."}
+- James's vehicle, if this call is about auto service: {veh if veh else "(not on file - if they need vehicle details not in your goal, say James will confirm them at drop-off)"}
 - If asked who you are or whether you're an AI: be honest and natural - you're Echo,
   James Jarrell's AI assistant, and James asked you to make this booking for him.
   Say it once, confidently, and get back to the booking.
@@ -192,6 +230,12 @@ How to handle the call:
 - Keep every turn short - one or two sentences. It's a phone call, not a speech.
 - When it's done, thank them, say a natural goodbye, and stop talking.
 """
+    # Personalization pass: swap James for the pilot user everywhere in one shot.
+    if full_name != "James Jarrell":
+        prompt = prompt.replace("James Jarrell", full_name).replace("James", first_name)
+    if notes:
+        prompt += f"\nEXTRA PREFERENCES from {first_name} (respect these):\n{notes}\n"
+    return prompt
 
 
 @app.get("/")
@@ -227,7 +271,7 @@ async def place_call(request: Request):
     return {"status": "calling", "call_sid": call.sid, "to": to_number, "goal": goal}
 
 
-async def parse_sms_request(text: str) -> dict:
+async def parse_sms_request(text: str, default_name: str = "James Jarrell") -> dict:
     """
     Real AI parsing step: turns a freeform text like
     "call Bob's Pizza at 615-555-1234, book a table for 4 at 7pm tonight under James"
@@ -252,10 +296,10 @@ async def parse_sms_request(text: str) -> dict:
                     "content": f"""A text message came in requesting a phone call be placed on someone's
 behalf (a restaurant reservation, a food order for pickup, or similar). Extract the phone number
 to call and a clear, specific goal for that call.
-If no name is given for a reservation or pickup, the name is "James Jarrell".
+If no name is given for a reservation or pickup, the name is "{default_name}".
 Write the goal as a natural phrase that completes the sentence "I'm calling to ..." (e.g. "book a
-table for two at 7pm tonight under James Jarrell" or "order a large cheese pizza for pickup at
-12pm under the name James Jarrell").
+table for two at 7pm tonight under {default_name}" or "order a large cheese pizza for pickup at
+12pm under the name {default_name}").
 Include EVERY detail given, whatever the request type: items, sizes, quantities, times,
 services requested (e.g. oil change, tire rotation, brake inspection), vehicle info
 (year/make/model/mileage), party sizes, special requests, and the name. Details the
@@ -344,8 +388,29 @@ async def sms_trigger(request: Request):
     from_number = form.get("From")
     body = form.get("Body", "")
 
+    # ---- Pilot gate: who is this, are they active, do they have calls left ----
+    user_fields, user_record_id = {}, None
+    if AIRTABLE_TOKEN:
+        user = await get_pilot_user(from_number)
+        if not user or not user.get("fields", {}).get("Active"):
+            twilio_client.messages.create(
+                to=from_number, from_=TRIGGER_PHONE_NUMBER,
+                body="VOX is currently invite-only. Reply if you think this is a mistake and we'll get you sorted.",
+            )
+            return PlainTextResponse("", media_type="application/xml")
+        user_fields = user.get("fields", {})
+        user_record_id = user["id"]
+        used = int(user_fields.get("Calls Used") or 0)
+        limit = int(user_fields.get("Call Limit") or 15)
+        if used >= limit:
+            twilio_client.messages.create(
+                to=from_number, from_=TRIGGER_PHONE_NUMBER,
+                body=f"You've used all {limit} of your pilot calls. Text James if you need more.",
+            )
+            return PlainTextResponse("", media_type="application/xml")
+
     try:
-        parsed = await parse_sms_request(body)
+        parsed = await parse_sms_request(body, user_fields.get("Name") or "James Jarrell")
     except Exception:
         twilio_client.messages.create(
             to=from_number, from_=TRIGGER_PHONE_NUMBER,
@@ -377,14 +442,23 @@ async def sms_trigger(request: Request):
         )
         return PlainTextResponse("", media_type="application/xml")
 
+    persona = {
+        "name": user_fields.get("Name") or "",
+        "callback": user_fields.get("Callback Number") or (from_number if user_fields else ""),
+        "vehicle": user_fields.get("Vehicle") or "",
+        "notes": user_fields.get("Notes") or "",
+    }
+    persona_b64 = base64.urlsafe_b64encode(json.dumps(persona).encode()).decode()
     call = twilio_client.calls.create(
         to=parsed["to"], from_=TWILIO_PHONE_NUMBER,
-        url=f"{PUBLIC_SERVER_URL}/twiml?goal={base64.urlsafe_b64encode(parsed['goal'].encode()).decode()}",
+        url=f"{PUBLIC_SERVER_URL}/twiml?goal={base64.urlsafe_b64encode(parsed['goal'].encode()).decode()}&persona={persona_b64}",
         status_callback=f"{PUBLIC_SERVER_URL}/call-status",
         status_callback_event=["completed"],
     )
     active_call_goals[call.sid] = parsed["goal"]
     active_call_requesters[call.sid] = from_number  # remember who to text the result back to
+    if user_record_id:
+        await increment_calls_used(user_record_id, int(user_fields.get("Calls Used") or 0))
 
     twilio_client.messages.create(
         to=from_number, from_=TRIGGER_PHONE_NUMBER,
@@ -428,6 +502,7 @@ async def twiml_endpoint(request: Request):
     """Twilio hits this the moment the call connects - tells Twilio to stream
     the live audio to our WebSocket instead of playing a static message."""
     goal_encoded = request.query_params.get("goal", "")
+    persona_encoded = request.query_params.get("persona", "")
     response = VoiceResponse()
     connect = Connect()
     stream_url = f"{PUBLIC_SERVER_URL.replace('https://', 'wss://')}/media-stream"
@@ -435,6 +510,8 @@ async def twiml_endpoint(request: Request):
     # Twilio strips query params from Media Stream URLs - custom Parameters are
     # the real, documented way to pass data. They arrive in the 'start' event.
     stream.parameter(name="goal", value=goal_encoded)
+    if persona_encoded:
+        stream.parameter(name="persona", value=persona_encoded)
     response.append(connect)
     return PlainTextResponse(str(response), media_type="application/xml")
 
@@ -450,6 +527,7 @@ async def handle_media_stream(websocket: WebSocket):
     stream_sid = None
     call_sid = None
     goal = "Have a helpful conversation."
+    persona = {}
     transcript_lines = []  # real, running transcript of what the AI actually said during the call
 
     # Twilio sends 'connected' then 'start' before any audio. The 'start' event
@@ -464,7 +542,13 @@ async def handle_media_stream(websocket: WebSocket):
             goal_encoded = data["start"].get("customParameters", {}).get("goal", "")
             if goal_encoded:
                 goal = base64.urlsafe_b64decode(goal_encoded).decode()
-            print(f"[CALL START] {call_sid} goal: {goal}")
+            persona_encoded = data["start"].get("customParameters", {}).get("persona", "")
+            if persona_encoded:
+                try:
+                    persona = json.loads(base64.urlsafe_b64decode(persona_encoded).decode())
+                except Exception:
+                    persona = {}
+            print(f"[CALL START] {call_sid} goal: {goal} persona: {persona.get('name') or 'James (default)'}")
 
     async with websockets.connect(
         f"wss://api.openai.com/v1/realtime?model={REALTIME_MODEL}",
@@ -489,7 +573,7 @@ async def handle_media_stream(websocket: WebSocket):
                     },
                 }],
                 "tool_choice": "auto",
-                "instructions": build_system_prompt(goal),
+                "instructions": build_system_prompt(goal, persona.get("name", ""), persona.get("callback", ""), persona.get("vehicle", ""), persona.get("notes", "")),
                 "audio": {
                     "input": {
                         "format": {"type": "audio/pcmu"},
